@@ -1,13 +1,15 @@
 import asyncio
 import decky
 import os
+import select
 import subprocess
 import sys
+import threading
 import time
 from settings import SettingsManager
 
 sys.path.insert(1, decky.DECKY_PLUGIN_DIR)
-from PyXRLinuxDriverIPC.xrdriveripc import XRDriverIPC, CONTROL_FLAGS_FILE_PATH
+from PyXRLinuxDriverIPC.xrdriveripc import XRDriverIPC
 
 INSTALLED_VERSION_SETTING_KEY = "installed_from_plugin_version"
 DONT_SHOW_AGAIN_SETTING_KEY = "dont_show_again"
@@ -19,26 +21,101 @@ BREEZY_INSTALL_TIMEOUT_SECONDS = 60
 RECENTER_BUTTON_ENABLED_KEY = "recenter_button_enabled"
 RECENTER_BUTTON_COMBO_KEY = "recenter_button_combo"
 DEFAULT_RECENTER_BUTTON_COMBO = "l4+r4"
+RECENTER_BUTTON_HIDRAW_DEVICE = "/dev/hidraw2"
+RECENTER_BUTTON_COOLDOWN_SECONDS = 1.0
 
-# valid --combo button names, mirrored from contrib/button_listener.sh's BUTTON_VARS
-BUTTON_NAMES = {
-    "a", "b", "x", "y", "l1", "r1", "l2", "r2", "l3", "r3", "l4", "r4",
-    "dup", "ddown", "dleft", "dright", "select", "start", "steam", "quick",
-    "lstick", "rstick", "lstouch", "rstouch",
-    "lpadtouch", "lpadpress", "rpadtouch", "rpadpress"
+# (byte offset, bitmask) for each button within a 64-byte controller HID report.
+# Byte offsets/masks verified against the Steam Deck's raw input report format.
+BUTTON_BITS = {
+    "a": (8, 0x80), "b": (8, 0x20), "x": (8, 0x40), "y": (8, 0x10),
+    "l1": (8, 0x08), "r1": (8, 0x04), "l2": (8, 0x02), "r2": (8, 0x01),
+    "dup": (9, 0x01), "dright": (9, 0x02), "dleft": (9, 0x04), "ddown": (9, 0x08),
+    "select": (9, 0x10), "steam": (9, 0x20), "start": (9, 0x40), "l4": (9, 0x80),
+    "r4": (10, 0x01), "lpadtouch": (10, 0x08), "rpadtouch": (10, 0x10), "lstick": (10, 0x40),
+    "rstick": (11, 0x04),
+    "l3": (13, 0x02), "r3": (13, 0x04), "lstouch": (13, 0x40), "rstouch": (13, 0x80),
+    "quick": (14, 0x04)
 }
+# lpadpress/rpadpress require both the touch and press bits set together
+BUTTON_NAMES = set(BUTTON_BITS) | {"lpadpress", "rpadpress"}
+
+
+def _button_pressed(report, name):
+    if name == "lpadpress":
+        return (report[10] & 0x0a) == 0x0a
+    if name == "rpadpress":
+        return (report[10] & 0x14) == 0x14
+
+    offset, mask = BUTTON_BITS[name]
+    return bool(report[offset] & mask)
+
+
+class RecenterButtonListener:
+    """Watches the controller's hidraw device on a background thread and fires
+    on_trigger() when every button in combo is pressed simultaneously
+    (edge-triggered, rate-limited by cooldown_seconds)."""
+
+    def __init__(self, combo, on_trigger, device_path=RECENTER_BUTTON_HIDRAW_DEVICE,
+                 cooldown_seconds=RECENTER_BUTTON_COOLDOWN_SECONDS):
+        self._combo_buttons = combo.split("+")
+        self._on_trigger = on_trigger
+        self._device_path = device_path
+        self._cooldown_seconds = cooldown_seconds
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=3)
+
+    def _run(self):
+        try:
+            fd = os.open(self._device_path, os.O_RDONLY)
+        except OSError as e:
+            decky.logger.error(f"Error opening {self._device_path}: {e}")
+            return
+
+        prev_pressed = False
+        last_triggered = 0.0
+        try:
+            while not self._stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+
+                report = os.read(fd, 64)
+                if len(report) < 15:
+                    continue
+
+                pressed = all(_button_pressed(report, name) for name in self._combo_buttons)
+                now = time.monotonic()
+                if pressed and not prev_pressed and (now - last_triggered) >= self._cooldown_seconds:
+                    last_triggered = now
+                    try:
+                        self._on_trigger()
+                    except Exception as e:
+                        decky.logger.error(f"Error running recenter button trigger: {e}")
+                prev_pressed = pressed
+        except OSError as e:
+            decky.logger.error(f"Error reading {self._device_path}: {e}")
+        finally:
+            os.close(fd)
+
 
 settings = SettingsManager(name="settings", settings_directory=decky.DECKY_PLUGIN_SETTINGS_DIR)
 settings.read()
 
-ipc = XRDriverIPC(logger = decky.logger, 
+ipc = XRDriverIPC(logger = decky.logger,
                   config_home = os.path.join(decky.DECKY_USER_HOME, ".config"),
                   supported_output_modes = ['virtual_display', 'sideview'])
 
 class Plugin:
     def __init__(self):
         self.breezy_installed = False
-        self._button_listener_proc = None
+        self._recenter_listener = None
 
     async def is_breezy_install_pending(self):
         started_at = settings.getSetting(BREEZY_INSTALL_STARTED_AT_SETTING_KEY)
@@ -90,20 +167,6 @@ class Plugin:
 
     async def write_control_flags(self, control_flags):
         ipc.write_control_flags(control_flags)
-        self._ensure_control_flags_file_writable()
-
-    def _ensure_control_flags_file_writable(self):
-        # os.open(..., 0o777) in write_control_flags is subject to umask, and
-        # the plugin backend runs as root while xr_driver_cli runs as the
-        # desktop user - if root creates/owns this file without it being
-        # world-writable, xr_driver_cli's writes (e.g. --recenter) silently
-        # fail with a permission error.
-        try:
-            os.chmod(CONTROL_FLAGS_FILE_PATH, 0o666)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            decky.logger.error(f"Error chmod'ing {CONTROL_FLAGS_FILE_PATH}: {e}")
 
     async def retrieve_driver_state(self):
         return ipc.retrieve_driver_state()
@@ -151,7 +214,7 @@ class Plugin:
 
         settings.setSetting(RECENTER_BUTTON_COMBO_KEY, combo)
         if settings.getSetting(RECENTER_BUTTON_ENABLED_KEY, False):
-            self._restart_button_listener(combo)
+            self._restart_recenter_listener(combo)
 
         return True
 
@@ -159,72 +222,31 @@ class Plugin:
         settings.setSetting(RECENTER_BUTTON_ENABLED_KEY, enabled)
         if enabled:
             combo = settings.getSetting(RECENTER_BUTTON_COMBO_KEY, DEFAULT_RECENTER_BUTTON_COMBO)
-            self._restart_button_listener(combo)
+            self._restart_recenter_listener(combo)
         else:
-            self._stop_button_listener()
+            self._stop_recenter_listener()
 
         return True
 
     def _is_valid_combo(self, combo):
         return bool(combo) and all(button in BUTTON_NAMES for button in combo.split("+"))
 
-    def _recenter_command(self):
-        # xr_driver_cli needs XDG_RUNTIME_DIR to find the user's systemd/D-Bus
-        # session (same requirement as XRDriverIPC.is_driver_running/reset_driver)
-        try:
-            uid = subprocess.check_output(['id', '-u', decky.DECKY_USER], stderr=subprocess.STDOUT).decode().strip()
-        except subprocess.CalledProcessError as e:
-            decky.logger.error(f"Error looking up uid for {decky.DECKY_USER}: {e.output}")
-            uid = "1000"
+    def _trigger_recenter(self):
+        ipc.write_control_flags({"recenter_screen": True})
 
-        return "su -l -c 'XDG_RUNTIME_DIR=/run/user/{} {}/.local/bin/xr_driver_cli --recenter' {}".format(
-            uid, decky.DECKY_USER_HOME, decky.DECKY_USER)
+    def _restart_recenter_listener(self, combo):
+        self._stop_recenter_listener()
+        self._start_recenter_listener(combo)
 
-    def _restart_button_listener(self, combo):
-        self._stop_button_listener()
-        self._start_button_listener(combo)
+    def _start_recenter_listener(self, combo):
+        decky.logger.info(f"Starting recenter button listener for combo '{combo}'")
+        self._recenter_listener = RecenterButtonListener(combo, self._trigger_recenter)
+        self._recenter_listener.start()
 
-    def _start_button_listener(self, combo):
-        script_path = os.path.join(decky.DECKY_PLUGIN_DIR, "contrib", "button_listener.sh")
-        if not os.path.isfile(script_path):
-            decky.logger.error(f"button_listener.sh not found at {script_path}")
-            return
-
-        self._ensure_control_flags_file_writable()
-
-        os.chmod(script_path, 0o755)
-        command = self._recenter_command()
-        decky.logger.info(f"Starting button_listener.sh: combo={combo} command={command}")
-
-        # strip LD_LIBRARY_PATH, which points at this plugin's bundled libs and
-        # shadows the system libreadline, breaking any bash invocation (including
-        # this script's own shebang and its internal `bash -c` command runner)
-        env_copy = os.environ.copy()
-        env_copy.pop("LD_LIBRARY_PATH", None)
-
-        try:
-            log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "button_listener.log")
-            log_file = open(log_path, "a")
-            self._button_listener_proc = subprocess.Popen(
-                [script_path, "--combo", combo, "--command", command, "--cooldown", "1", "--verbose"],
-                stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True, env=env_copy)
-            log_file.close()
-            decky.logger.info(f"button_listener.sh started, pid={self._button_listener_proc.pid}")
-        except OSError as e:
-            decky.logger.error(f"Error starting button_listener.sh: {e}")
-
-    def _stop_button_listener(self):
-        proc = self._button_listener_proc
-        self._button_listener_proc = None
-
-        if proc is None or proc.poll() is not None:
-            return
-
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    def _stop_recenter_listener(self):
+        if self._recenter_listener is not None:
+            self._recenter_listener.stop()
+            self._recenter_listener = None
 
     async def check_breezy_installed(self):
         try:
@@ -329,11 +351,11 @@ class Plugin:
 
         if settings.getSetting(RECENTER_BUTTON_ENABLED_KEY, False):
             combo = settings.getSetting(RECENTER_BUTTON_COMBO_KEY, DEFAULT_RECENTER_BUTTON_COMBO)
-            self._start_button_listener(combo)
+            self._start_recenter_listener(combo)
 
     # Function called first during the unload process, utilize this to handle your plugin being removed
     async def _unload(self):
-        self._stop_button_listener()
+        self._stop_recenter_listener()
 
     # Migrations that should be performed before entering `_main()`.
     async def _migration(self):
@@ -342,7 +364,7 @@ class Plugin:
     async def _uninstall(self):
         decky.logger.info(f"Uninstalling breezy for plugin version {decky.DECKY_PLUGIN_VERSION}")
 
-        self._stop_button_listener()
+        self._stop_recenter_listener()
 
         # Set the USER environment variable for this command
         env_copy = os.environ.copy()

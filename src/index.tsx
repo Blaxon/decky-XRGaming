@@ -111,8 +111,8 @@ const RECENTER_BUTTON_COMBO_OPTIONS = [
     {label: "R4 (back grip)", data: "r4"},
     {label: "L1 + R1", data: "l1+r1"},
     {label: "L2 + R2", data: "l2+r2"},
-    {label: "L3 + R3 (stick clicks)", data: "l3+r3"},
-    {label: "L4 + R4 (back grips)", data: "l4+r4"},
+    {label: "L3 + R3 (upper back grips)", data: "l3+r3"},
+    {label: "L4 + R4 (lower back grips)", data: "l4+r4"},
     {label: "Steam + A", data: "steam+a"}
 ];
 const ManagedExternalModes: ExternalMode[] = ['virtual_display', 'sideview', 'none'];
