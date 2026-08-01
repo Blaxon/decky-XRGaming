@@ -108,6 +108,7 @@ type RecenterButtonConfig = {
 }
 
 const RECENTER_BUTTON_COMBO_OPTIONS = [
+    {label: "Disabled", data: ""},
     {label: "R4 (back grip)", data: "r4"},
     {label: "L1 + R1", data: "l1+r1"},
     {label: "L2 + R2", data: "l2+r2"},
@@ -350,6 +351,18 @@ const Content: VFC = () => {
             setRecenterButtonConfig((prev) => prev && {...prev, combo});
         } catch (e) {
             setError((e as Error).message);
+        }
+    }
+
+    async function selectRecenterButtonCombo(combo: string) {
+        if (!combo) {
+            await setRecenterButtonEnabled(false);
+            return;
+        }
+
+        await setRecenterButtonCombo(combo);
+        if (!recenterButtonConfig?.enabled) {
+            await setRecenterButtonEnabled(true);
         }
     }
 
@@ -1195,19 +1208,13 @@ const Content: VFC = () => {
                             </ButtonItem>
                         </PanelSectionRow>}
                         {is3DoFMode && <PanelSectionRow>
-                            <ToggleField
-                                checked={recenterButtonConfig?.enabled ?? false}
-                                label={"Recenter with a controller combo"}
-                                description={"Keeps working mid-game, even when Steam Input has grabbed the controller."}
-                                onChange={(enabled) => setRecenterButtonEnabled(enabled).catch(e => setError(e))}/>
-                        </PanelSectionRow>}
-                        {is3DoFMode && recenterButtonConfig?.enabled && <PanelSectionRow>
                             <DropdownItem
-                                label={"Button combo"}
+                                label={"Recenter with a controller combo"}
                                 menuLabel={"Button combo"}
-                                selectedOption={recenterButtonConfig.combo}
+                                description={"Keeps working mid-game, even when Steam Input has grabbed the controller."}
+                                selectedOption={recenterButtonConfig?.enabled ? recenterButtonConfig.combo : ""}
                                 rgOptions={RECENTER_BUTTON_COMBO_OPTIONS}
-                                onChange={(selection) => setRecenterButtonCombo(selection.data as string).catch(e => setError(e))}
+                                onChange={(selection) => selectRecenterButtonCombo(selection.data as string).catch(e => setError(e))}
                             />
                         </PanelSectionRow>}
                         {is3DoFMode && <PanelSectionRow>
