@@ -102,6 +102,20 @@ type CalibrationState = "NOT_CALIBRATED" | "CALIBRATING" | "CALIBRATED" | "WAITI
 type SbsModeControl = "unset" | "enable" | "disable";
 type SideviewPosition = "center" | "top_left" | "top_right" | "bottom_left" | "bottom_right";
 type MeasurementUnits = "cm" | "in";
+type RecenterButtonConfig = {
+    enabled: boolean;
+    combo: string;
+}
+
+const RECENTER_BUTTON_COMBO_OPTIONS = [
+    {label: "Disabled", data: ""},
+    {label: "R4 (back grip)", data: "r4"},
+    {label: "L1 + R1", data: "l1+r1"},
+    {label: "L2 + R2", data: "l2+r2"},
+    {label: "L3 + R3 (upper back grips)", data: "l3+r3"},
+    {label: "L4 + R4 (lower back grips)", data: "l4+r4"},
+    {label: "Steam + A", data: "steam+a"}
+];
 const ManagedExternalModes: ExternalMode[] = ['virtual_display', 'sideview', 'none'];
 const SideviewPositions: SideviewPosition[] = ["center", "top_left", "top_right", "bottom_left", "bottom_right"];
 const DirtyControlFlagsExpireMilliseconds = 3000;
@@ -276,6 +290,7 @@ const Content: VFC = () => {
     const [forceResettingDriver, setForceResettingDriver] = useState<boolean>(false);
     const [error, setError] = useState<string>();
     const [dontShowAgainKeys, setDontShowAgainKeys] = useState<string[]>([]);
+    const [recenterButtonConfig, setRecenterButtonConfig] = useState<RecenterButtonConfig>();
     const [dirtyHeadsetMode, stableHeadsetMode, setDirtyHeadsetMode] = useStableState<HeadsetModeOption | undefined>(undefined, HeadsetModeConfirmationTimeoutMs);
 
     async function refreshConfig() {
@@ -310,6 +325,44 @@ const Content: VFC = () => {
             setDontShowAgainKeys(await call<[], string[]>("retrieve_dont_show_again_keys"));
         } catch (e) {
             setError((e as Error).message);
+        }
+    }
+
+    async function refreshRecenterButtonConfig() {
+        try {
+            setRecenterButtonConfig(await call<[], RecenterButtonConfig>("get_recenter_button_config"));
+        } catch (e) {
+            setError((e as Error).message);
+        }
+    }
+
+    async function setRecenterButtonEnabled(enabled: boolean) {
+        try {
+            await call<[ enabled: boolean ], boolean>("set_recenter_button_enabled", enabled);
+            setRecenterButtonConfig((prev) => prev && {...prev, enabled});
+        } catch (e) {
+            setError((e as Error).message);
+        }
+    }
+
+    async function setRecenterButtonCombo(combo: string) {
+        try {
+            await call<[ combo: string ], boolean>("set_recenter_button_combo", combo);
+            setRecenterButtonConfig((prev) => prev && {...prev, combo});
+        } catch (e) {
+            setError((e as Error).message);
+        }
+    }
+
+    async function selectRecenterButtonCombo(combo: string) {
+        if (!combo) {
+            await setRecenterButtonEnabled(false);
+            return;
+        }
+
+        await setRecenterButtonCombo(combo);
+        if (!recenterButtonConfig?.enabled) {
+            await setRecenterButtonEnabled(true);
         }
     }
 
@@ -538,6 +591,7 @@ const Content: VFC = () => {
         checkInstallation().catch((err) => setError(err));
         refreshDriverState().catch((err) => setError(err));
         refreshDontShowAgainKeys().catch((err) => setError(err));
+        refreshRecenterButtonConfig().catch((err) => setError(err));
     }, []);
 
     useEffect(() => {
@@ -1152,6 +1206,16 @@ const Content: VFC = () => {
                                     "Recenter display"
                                 }
                             </ButtonItem>
+                        </PanelSectionRow>}
+                        {is3DoFMode && <PanelSectionRow>
+                            <DropdownItem
+                                label={"Recenter with a controller combo"}
+                                menuLabel={"Button combo"}
+                                description={"Keeps working mid-game, even when Steam Input has grabbed the controller."}
+                                selectedOption={recenterButtonConfig?.enabled ? recenterButtonConfig.combo : ""}
+                                rgOptions={RECENTER_BUTTON_COMBO_OPTIONS}
+                                onChange={(selection) => selectRecenterButtonCombo(selection.data as string).catch(e => setError(e))}
+                            />
                         </PanelSectionRow>}
                         {is3DoFMode && <PanelSectionRow>
                             <ToggleField

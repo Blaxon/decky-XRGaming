@@ -1,8 +1,10 @@
 import asyncio
 import decky
 import os
+import select
 import subprocess
 import sys
+import threading
 import time
 from settings import SettingsManager
 
@@ -16,16 +18,104 @@ MEASUREMENT_UNITS_SETTING_KEY = "measurement_units"
 BREEZY_INSTALL_STARTED_AT_SETTING_KEY = "breezy_install_started_at"
 BREEZY_INSTALL_TIMEOUT_SECONDS = 60
 
+RECENTER_BUTTON_ENABLED_KEY = "recenter_button_enabled"
+RECENTER_BUTTON_COMBO_KEY = "recenter_button_combo"
+DEFAULT_RECENTER_BUTTON_COMBO = "l4+r4"
+RECENTER_BUTTON_HIDRAW_DEVICE = "/dev/hidraw2"
+RECENTER_BUTTON_COOLDOWN_SECONDS = 1.0
+
+# (byte offset, bitmask) for each button within a 64-byte controller HID report.
+# Byte offsets/masks verified against the Steam Deck's raw input report format.
+BUTTON_BITS = {
+    "a": (8, 0x80), "b": (8, 0x20), "x": (8, 0x40), "y": (8, 0x10),
+    "l1": (8, 0x08), "r1": (8, 0x04), "l2": (8, 0x02), "r2": (8, 0x01),
+    "dup": (9, 0x01), "dright": (9, 0x02), "dleft": (9, 0x04), "ddown": (9, 0x08),
+    "select": (9, 0x10), "steam": (9, 0x20), "start": (9, 0x40), "l4": (9, 0x80),
+    "r4": (10, 0x01), "lpadtouch": (10, 0x08), "rpadtouch": (10, 0x10), "lstick": (10, 0x40),
+    "rstick": (11, 0x04),
+    "l3": (13, 0x02), "r3": (13, 0x04), "lstouch": (13, 0x40), "rstouch": (13, 0x80),
+    "quick": (14, 0x04)
+}
+# lpadpress/rpadpress require both the touch and press bits set together
+BUTTON_NAMES = set(BUTTON_BITS) | {"lpadpress", "rpadpress"}
+
+
+def _button_pressed(report, name):
+    if name == "lpadpress":
+        return (report[10] & 0x0a) == 0x0a
+    if name == "rpadpress":
+        return (report[10] & 0x14) == 0x14
+
+    offset, mask = BUTTON_BITS[name]
+    return bool(report[offset] & mask)
+
+
+class RecenterButtonListener:
+    """Watches the controller's hidraw device on a background thread and fires
+    on_trigger() when every button in combo is pressed simultaneously
+    (edge-triggered, rate-limited by cooldown_seconds)."""
+
+    def __init__(self, combo, on_trigger, device_path=RECENTER_BUTTON_HIDRAW_DEVICE,
+                 cooldown_seconds=RECENTER_BUTTON_COOLDOWN_SECONDS):
+        self._combo_buttons = combo.split("+")
+        self._on_trigger = on_trigger
+        self._device_path = device_path
+        self._cooldown_seconds = cooldown_seconds
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=3)
+
+    def _run(self):
+        try:
+            fd = os.open(self._device_path, os.O_RDONLY)
+        except OSError as e:
+            decky.logger.error(f"Error opening {self._device_path}: {e}")
+            return
+
+        prev_pressed = False
+        last_triggered = 0.0
+        try:
+            while not self._stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+
+                report = os.read(fd, 64)
+                if len(report) < 15:
+                    continue
+
+                pressed = all(_button_pressed(report, name) for name in self._combo_buttons)
+                now = time.monotonic()
+                if pressed and not prev_pressed and (now - last_triggered) >= self._cooldown_seconds:
+                    last_triggered = now
+                    try:
+                        self._on_trigger()
+                    except Exception as e:
+                        decky.logger.error(f"Error running recenter button trigger: {e}")
+                prev_pressed = pressed
+        except OSError as e:
+            decky.logger.error(f"Error reading {self._device_path}: {e}")
+        finally:
+            os.close(fd)
+
+
 settings = SettingsManager(name="settings", settings_directory=decky.DECKY_PLUGIN_SETTINGS_DIR)
 settings.read()
 
-ipc = XRDriverIPC(logger = decky.logger, 
+ipc = XRDriverIPC(logger = decky.logger,
                   config_home = os.path.join(decky.DECKY_USER_HOME, ".config"),
                   supported_output_modes = ['virtual_display', 'sideview'])
 
 class Plugin:
     def __init__(self):
         self.breezy_installed = False
+        self._recenter_listener = None
 
     async def is_breezy_install_pending(self):
         started_at = settings.getSetting(BREEZY_INSTALL_STARTED_AT_SETTING_KEY)
@@ -110,6 +200,53 @@ class Plugin:
 
     async def force_reset_driver(self):
         return ipc.reset_driver(as_user=decky.DECKY_USER)
+
+    async def get_recenter_button_config(self):
+        return {
+            "enabled": settings.getSetting(RECENTER_BUTTON_ENABLED_KEY, False),
+            "combo": settings.getSetting(RECENTER_BUTTON_COMBO_KEY, DEFAULT_RECENTER_BUTTON_COMBO)
+        }
+
+    async def set_recenter_button_combo(self, combo):
+        if not self._is_valid_combo(combo):
+            decky.logger.error(f"Rejected invalid recenter button combo: {combo}")
+            return False
+
+        settings.setSetting(RECENTER_BUTTON_COMBO_KEY, combo)
+        if settings.getSetting(RECENTER_BUTTON_ENABLED_KEY, False):
+            self._restart_recenter_listener(combo)
+
+        return True
+
+    async def set_recenter_button_enabled(self, enabled):
+        settings.setSetting(RECENTER_BUTTON_ENABLED_KEY, enabled)
+        if enabled:
+            combo = settings.getSetting(RECENTER_BUTTON_COMBO_KEY, DEFAULT_RECENTER_BUTTON_COMBO)
+            self._restart_recenter_listener(combo)
+        else:
+            self._stop_recenter_listener()
+
+        return True
+
+    def _is_valid_combo(self, combo):
+        return bool(combo) and all(button in BUTTON_NAMES for button in combo.split("+"))
+
+    def _trigger_recenter(self):
+        ipc.write_control_flags({"recenter_screen": True})
+
+    def _restart_recenter_listener(self, combo):
+        self._stop_recenter_listener()
+        self._start_recenter_listener(combo)
+
+    def _start_recenter_listener(self, combo):
+        decky.logger.info(f"Starting recenter button listener for combo '{combo}'")
+        self._recenter_listener = RecenterButtonListener(combo, self._trigger_recenter)
+        self._recenter_listener.start()
+
+    def _stop_recenter_listener(self):
+        if self._recenter_listener is not None:
+            self._recenter_listener.stop()
+            self._recenter_listener = None
 
     async def check_breezy_installed(self):
         try:
@@ -212,9 +349,13 @@ class Plugin:
     async def _main(self):
         self.loop = asyncio.get_event_loop()
 
+        if settings.getSetting(RECENTER_BUTTON_ENABLED_KEY, False):
+            combo = settings.getSetting(RECENTER_BUTTON_COMBO_KEY, DEFAULT_RECENTER_BUTTON_COMBO)
+            self._start_recenter_listener(combo)
+
     # Function called first during the unload process, utilize this to handle your plugin being removed
     async def _unload(self):
-        pass
+        self._stop_recenter_listener()
 
     # Migrations that should be performed before entering `_main()`.
     async def _migration(self):
@@ -222,6 +363,8 @@ class Plugin:
 
     async def _uninstall(self):
         decky.logger.info(f"Uninstalling breezy for plugin version {decky.DECKY_PLUGIN_VERSION}")
+
+        self._stop_recenter_listener()
 
         # Set the USER environment variable for this command
         env_copy = os.environ.copy()
