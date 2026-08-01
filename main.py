@@ -155,8 +155,16 @@ class Plugin:
         return bool(combo) and all(button in BUTTON_NAMES for button in combo.split("+"))
 
     def _recenter_command(self):
-        return "su -l -c '{}/.local/bin/xr_driver_cli --recenter' {}".format(
-            decky.DECKY_USER_HOME, decky.DECKY_USER)
+        # xr_driver_cli needs XDG_RUNTIME_DIR to find the user's systemd/D-Bus
+        # session (same requirement as XRDriverIPC.is_driver_running/reset_driver)
+        try:
+            uid = subprocess.check_output(['id', '-u', decky.DECKY_USER], stderr=subprocess.STDOUT).decode().strip()
+        except subprocess.CalledProcessError as e:
+            decky.logger.error(f"Error looking up uid for {decky.DECKY_USER}: {e.output}")
+            uid = "1000"
+
+        return "su -l -c 'XDG_RUNTIME_DIR=/run/user/{} {}/.local/bin/xr_driver_cli --recenter' {}".format(
+            uid, decky.DECKY_USER_HOME, decky.DECKY_USER)
 
     def _restart_button_listener(self, combo):
         self._stop_button_listener()
