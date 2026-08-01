@@ -7,7 +7,7 @@ import time
 from settings import SettingsManager
 
 sys.path.insert(1, decky.DECKY_PLUGIN_DIR)
-from PyXRLinuxDriverIPC.xrdriveripc import XRDriverIPC
+from PyXRLinuxDriverIPC.xrdriveripc import XRDriverIPC, CONTROL_FLAGS_FILE_PATH
 
 INSTALLED_VERSION_SETTING_KEY = "installed_from_plugin_version"
 DONT_SHOW_AGAIN_SETTING_KEY = "dont_show_again"
@@ -90,6 +90,20 @@ class Plugin:
 
     async def write_control_flags(self, control_flags):
         ipc.write_control_flags(control_flags)
+        self._ensure_control_flags_file_writable()
+
+    def _ensure_control_flags_file_writable(self):
+        # os.open(..., 0o777) in write_control_flags is subject to umask, and
+        # the plugin backend runs as root while xr_driver_cli runs as the
+        # desktop user - if root creates/owns this file without it being
+        # world-writable, xr_driver_cli's writes (e.g. --recenter) silently
+        # fail with a permission error.
+        try:
+            os.chmod(CONTROL_FLAGS_FILE_PATH, 0o666)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.error(f"Error chmod'ing {CONTROL_FLAGS_FILE_PATH}: {e}")
 
     async def retrieve_driver_state(self):
         return ipc.retrieve_driver_state()
@@ -175,6 +189,8 @@ class Plugin:
         if not os.path.isfile(script_path):
             decky.logger.error(f"button_listener.sh not found at {script_path}")
             return
+
+        self._ensure_control_flags_file_writable()
 
         os.chmod(script_path, 0o755)
         command = self._recenter_command()
